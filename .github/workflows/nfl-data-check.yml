@@ -1,7 +1,7 @@
-name: NFL public-data check
+ NFL name: NFL historical public-data collection
 
-# Public sources only. No personal ledgers, API keys, accounts, or wagers.
-# This checks file transfer; it does not train or validate an NFL model.
+# Raw public inputs only. No wagers, personal records, paid services or credentials.
+# Replaces the two-file transfer check. This does NOT train the full NFL model.
 "on":
   workflow_dispatch:
   push:
@@ -12,138 +12,270 @@ permissions:
   contents: read
 
 concurrency:
-  group: nfl-data-check-${{ github.ref }}
+  group: nfl-historical-public-data-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  download-check:
+  collect:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        season: [2022, 2023, 2024, 2025]
+    env:
+      NFL_SEASON: ${{ matrix.season }}
     steps:
-      - name: Download and verify two public files
+      - name: Download and inspect public datasets
         shell: bash
         run: |
           python3 - <<'PYTHON'
-          """Public data transfer check only. No predictions, accounts, or purchases."""
+          """Collect public NFL sources for one season; no model training or wagers."""
           from __future__ import annotations
-
           import csv
+          import gzip
           import hashlib
           import io
           import json
           import os
+          import time
+          from collections import Counter
           from datetime import datetime, timezone
           from pathlib import Path
+          from urllib.error import HTTPError
           from urllib.request import Request, urlopen
-
-          MAX_BYTES = 25 * 1024 * 1024
-          SOURCES = [
-              ("games.csv", "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv", "schedule"),
-              ("injuries_2022.csv", "https://github.com/nflverse/nflverse-data/releases/download/injuries/injuries_2022.csv", "injuries"),
-          ]
-          REQUIRED = {
-              "schedule": {"game_id", "season", "game_type", "week", "away_team", "home_team", "gameday"},
-              "injuries": {"season", "game_type", "team", "week", "gsis_id", "full_name", "position", "report_status", "practice_status"},
+          
+          BASE = "https://github.com/nflverse/nflverse-data/releases/download/"
+          MAX_FILE = 192 * 1024 * 1024
+          MAX_TOTAL = 1024 * 1024 * 1024
+          MAX_EXPANDED = 512 * 1024 * 1024
+          MIN_COLUMNS = {
+              "schedule": {"game_id", "season", "week", "away_team", "home_team"},
+              "injuries": {"season", "week", "team", "gsis_id", "report_status"},
+              "weekly_rosters": {"season", "week", "team", "gsis_id", "position"},
+              "snap_counts": {"game_id", "season", "week", "player", "position"},
+              "play_by_play": {"game_id", "season", "week", "posteam", "defteam"},
+              "ftn_charting": {"nflverse_game_id", "season", "week"},
           }
-
-
-          def inspect_csv(payload: bytes, family: str) -> dict:
-              text = payload.decode("utf-8-sig")
-              if text.lstrip().lower().startswith(("<!doctype html", "<html")):
-                  raise ValueError("An HTML page was returned, not a data file")
-              reader = csv.DictReader(io.StringIO(text))
-              fields = reader.fieldnames or []
-              if len(fields) != len(set(fields)):
-                  raise ValueError("Duplicate CSV headers")
-              missing = REQUIRED[family] - set(fields)
-              if missing:
-                  raise ValueError(f"Missing required columns: {sorted(missing)}")
-              rows = list(reader)
-              if not rows or any(None in row for row in rows):
-                  raise ValueError("Empty or malformed CSV records")
-              selected = [r for r in rows if r["season"] == "2022" and r["game_type"] == "REG"]
-              if not selected:
-                  raise ValueError("No 2022 regular-season records")
-              weeks = sorted({int(r["week"]) for r in selected})
-              if not all(1 <= w <= 18 for w in weeks):
-                  raise ValueError("Unexpected regular-season week")
-              if family == "schedule":
-                  identifiers = [r["game_id"] for r in selected]
-                  if len(identifiers) != len(set(identifiers)):
-                      raise ValueError("Duplicate game IDs in the 2022 schedule")
-                  teams = {r[k] for r in selected for k in ("away_team", "home_team")}
-              else:
-                  teams = {r["team"] for r in selected}
-              return {
-                  "rows_all": len(rows), "rows_2022_regular": len(selected),
-                  "teams_2022_regular": len(teams), "weeks_2022_regular": weeks,
-                  "columns": fields, "has_date_modified": "date_modified" in fields,
-                  "point_in_time_verified": False,
-              }
-
-
-          def main() -> int:
-              out = Path("nfl-data-check")
-              out.mkdir(exist_ok=True)
-              records = []
-              for name, url, family in SOURCES:
-                  record = {"file": name, "source_url": url, "family": family,
-                            "retrieved_at_utc": datetime.now(timezone.utc).isoformat()}
+          
+          
+          def now() -> str:
+              return datetime.now(timezone.utc).isoformat()
+          
+          
+          def plan(year: int) -> list[dict]:
+              specs = [
+                  ("injuries", "injuries", "injuries_", True),
+                  ("weekly_rosters", "weekly_rosters", "roster_weekly_", True),
+                  ("depth_charts", "depth_charts", "depth_charts_", True),
+                  ("snap_counts", "snap_counts", "snap_counts_", True),
+                  ("play_by_play", "pbp", "play_by_play_", True),
+                  ("ftn_charting", "ftn_charting", "ftn_charting_", False),
+              ]
+              specs += [("pfr_" + kind, "pfr_advstats", "advstats_week_" + kind + "_", False)
+                        for kind in ("pass", "rush", "rec", "def")]
+              rows = [{"family": "schedule", "stem": "games", "required": True,
+                       "urls": ["https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"]}]
+              for family, tag, prefix, required in specs:
+                  stem = prefix + str(year)
+                  rows.append({"family": family, "stem": stem, "required": required,
+                               "urls": [BASE + tag + "/" + stem + ext for ext in (".csv.gz", ".csv")]})
+              if year == 2022:
+                  for kind in ("passing", "rushing", "receiving"):
+                      stem = "ngs_" + kind
+                      rows.append({"family": "nextgen_" + kind, "stem": stem, "required": False,
+                                   "urls": [BASE + "nextgen_stats/" + stem + ext for ext in (".csv.gz", ".csv")]})
+                  for tag in ("officials", "combine"):
+                      rows.append({"family": tag, "stem": tag, "required": False,
+                                   "urls": [BASE + tag + "/" + tag + ext for ext in (".csv.gz", ".csv")]})
+              return rows
+          
+          
+          def number(value):
+              try:
+                  return int(float(value))
+              except (TypeError, ValueError, OverflowError):
+                  return None
+          
+          
+          def inspect_csv(path: Path, family: str, year: int) -> dict:
+              opener = gzip.open if path.name.endswith(".gz") else open
+              counts, regular, weeks, teams = Counter(), Counter(), set(), set()
+              timestamp_fields, timestamp_nonempty, inspected_cells = [], Counter(), 0
+              rows = selected = 0
+              with opener(path, "rt", encoding="utf-8-sig", newline="") as f:
+                  reader = csv.DictReader(f)
+                  fields = reader.fieldnames or []
+                  if len(fields) < 2 or len(set(fields)) != len(fields):
+                      raise ValueError("Invalid or duplicated CSV columns")
+                  missing = MIN_COLUMNS.get(family, set()) - set(fields)
+                  if missing:
+                      raise ValueError("Missing columns: " + ", ".join(sorted(missing)))
+                  timestamp_fields = [x for x in fields if x in (
+                      "date_modified", "timestamp", "dt", "updated_at", "last_update", "date")]
+                  for row in reader:
+                      if None in row or any(v is None for v in row.values()):
+                          raise ValueError("Malformed CSV row")
+                      rows += 1
+                      inspected_cells += sum(len(x) for x in row.values())
+                      if inspected_cells > MAX_EXPANDED:
+                          raise ValueError("Expanded CSV safety limit reached")
+                      season = number(row.get("season", row.get("year")))
+                      if season is not None:
+                          counts[str(season)] += 1
+                      game_type = row.get("game_type", row.get("season_type", ""))
+                      if season is not None and game_type == "REG":
+                          regular[str(season)] += 1
+                      if season == year:
+                          selected += 1
+                          w = number(row.get("week"))
+                          if w is not None:
+                              weeks.add(w)
+                          for key in ("team", "recent_team", "posteam", "defteam", "away_team", "home_team"):
+                              if row.get(key):
+                                  teams.add(row[key])
+                          for key in timestamp_fields:
+                              timestamp_nonempty[key] += bool(row.get(key))
+              if rows == 0:
+                  raise ValueError("Empty CSV")
+              if family in MIN_COLUMNS and selected == 0:
+                  raise ValueError("No requested-season rows found")
+              return {"rows_all": rows, "columns": fields,
+                      "rows_by_season": dict(sorted(counts.items())),
+                      "regular_rows_by_season": dict(sorted(regular.items())),
+                      "requested_season_rows": selected, "requested_season_weeks": sorted(weeks),
+                      "requested_season_team_labels": sorted(teams),
+                      "timestamp_fields": timestamp_fields,
+                      "requested_season_nonempty_timestamp_counts": dict(timestamp_nonempty),
+                      "point_in_time_verified": False, "implemented_as_model_feature": False}
+          
+          
+          def fetch_file(url: str, target: Path, remaining: int) -> dict:
+              limit = min(MAX_FILE, remaining)
+              if limit <= 0:
+                  raise ValueError("Total download safety limit reached")
+              partial = target.with_name(target.name + ".partial")
+              for attempt in range(2):
+                  size = 0
+                  digest = hashlib.sha256()
                   try:
-                      req = Request(url, headers={"User-Agent": "nfl-public-data-check/1.0"})
-                      with urlopen(req, timeout=90) as response:
-                          if "html" in response.headers.get("Content-Type", "").lower():
-                              raise ValueError("Source returned HTML")
-                          payload = response.read(MAX_BYTES + 1)
-                          record["source_last_modified"] = response.headers.get("Last-Modified")
-                          record["source_etag"] = response.headers.get("ETag")
-                      if len(payload) > MAX_BYTES:
-                          raise ValueError("Response exceeds the 25 MiB per-file limit")
-                      report = inspect_csv(payload, family)
-                      if report["teams_2022_regular"] != 32:
-                          raise ValueError("2022 data does not contain all 32 teams")
-                      if report["weeks_2022_regular"] != list(range(1, 19)):
-                          raise ValueError("2022 data does not contain weeks 1-18")
-                      if report["rows_2022_regular"] < (250 if family == "schedule" else 1000):
-                          raise ValueError("Unexpectedly small 2022 dataset")
-                      (out / name).write_bytes(payload)
-                      record.update(report, status="DOWNLOADED_AND_STRUCTURE_CHECKED",
-                                    bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+                      req = Request(url, headers={"User-Agent": "nfl-research-public-collector/2.0"})
+                      with urlopen(req, timeout=60) as response, partial.open("wb") as f:
+                          content_type = response.headers.get("Content-Type", "")
+                          if "text/html" in content_type.lower():
+                              raise ValueError("HTML returned instead of dataset")
+                          declared = number(response.headers.get("Content-Length"))
+                          if declared and declared > limit:
+                              raise ValueError("Declared file size exceeds safety limit")
+                          while True:
+                              block = response.read(1024 * 1024)
+                              if not block:
+                                  break
+                              size += len(block)
+                              if size > limit:
+                                  raise ValueError("File exceeds safety limit")
+                              digest.update(block)
+                              f.write(block)
+                          headers = {"source_last_modified": response.headers.get("Last-Modified"),
+                                     "source_etag": response.headers.get("ETag"), "content_type": content_type}
+                      if size == 0:
+                          raise ValueError("Empty response")
+                      partial.replace(target)
+                      return {**headers, "bytes": size, "sha256": digest.hexdigest(), "retrieved_at_utc": now()}
                   except Exception as exc:
-                      record.update(status="FAILED", error=f"{type(exc).__name__}: {str(exc)[:250]}")
-                  records.append(record)
-                  print(json.dumps({k: v for k, v in record.items() if k != "columns"}))
-              passed = all(r["status"] == "DOWNLOADED_AND_STRUCTURE_CHECKED" for r in records)
-              report = {
-                  "status": "TRANSFER_CHECK_PASSED" if passed else "TRANSFER_CHECK_FAILED",
-                  "created_at_utc": datetime.now(timezone.utc).isoformat(),
-                  "workflow_run_id": os.getenv("GITHUB_RUN_ID"), "workflow_commit": os.getenv("GITHUB_SHA"),
-                  "scope": "Two public source files only. No injury impact features, model run, or historical accuracy claim.",
-                  "warning": "Schema and counts do not prove completeness, original publication timing, or forecast suitability.",
-                  "files": records,
-              }
-              (out / "manifest.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-              lines = ["# NFL public-data transfer check", "", report["status"], "", report["scope"], "", report["warning"], ""]
-              for row in records:
-                  lines.append(f"- {row['file']}: {row['status']}; 2022 REG rows: {row.get('rows_2022_regular', 'N/A')}")
-              summary = "\n".join(lines) + "\n"
-              (out / "summary.md").write_text(summary, encoding="utf-8")
+                      partial.unlink(missing_ok=True)
+                      if attempt or isinstance(exc, ValueError) or (isinstance(exc, HTTPError) and exc.code in (401, 403, 404)):
+                          raise
+                      time.sleep(2)
+              raise RuntimeError("Unreachable retry state")
+          
+          
+          def main() -> int:
+              year = int(os.environ.get("NFL_SEASON", "2022"))
+              if year not in (2022, 2023, 2024, 2025):
+                  raise ValueError("Only seasons 2022-2025 are allowed")
+              out = Path("nfl-public-data") / str(year)
+              raw = out / "raw"
+              raw.mkdir(parents=True, exist_ok=True)
+              records, total = [], 0
+              for item in plan(year):
+                  result = {"family": item["family"], "required": item["required"], "attempts": []}
+                  for url in item["urls"]:
+                      target = raw / url.rsplit("/", 1)[-1]
+                      try:
+                          transfer = fetch_file(url, target, MAX_TOTAL - total)
+                          total += transfer["bytes"]
+                          try:
+                              inspection = inspect_csv(target, item["family"], year)
+                          except Exception as exc:
+                              result.update(status="DOWNLOADED_SCHEMA_REVIEW_REQUIRED", file=target.name,
+                                            source_url=url, **transfer,
+                                            error=f"{type(exc).__name__}: {str(exc)[:250]}")
+                              break
+                          result.update(status="DOWNLOADED_AND_STRUCTURE_CHECKED", file=target.name,
+                                        source_url=url, **transfer, **inspection)
+                          break
+                      except Exception as exc:
+                          result["attempts"].append({"url": url, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
+                  if "status" not in result:
+                      result["status"] = "NOT_ACQUIRED"
+                  records.append(result)
+                  print(json.dumps({k: result[k] for k in ("family", "status", "file", "bytes", "rows_all") if k in result}))
+                  (out / "manifest.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
+              blockers = [x["family"] for x in records if x["required"] and x["status"] != "DOWNLOADED_AND_STRUCTURE_CHECKED"]
+              gaps = [x["family"] for x in records if x["status"] != "DOWNLOADED_AND_STRUCTURE_CHECKED"]
+              report = {"season": year, "created_at_utc": now(), "run_id": os.getenv("GITHUB_RUN_ID"),
+                        "workflow_commit": os.getenv("GITHUB_SHA"), "total_bytes": total,
+                        "checked_files": sum(x["status"] == "DOWNLOADED_AND_STRUCTURE_CHECKED" for x in records),
+                        "planned_files": len(records), "required_gaps": blockers, "all_file_gaps": gaps,
+                        "status": "RAW_COLLECTION_INCOMPLETE" if gaps else "PLANNED_RAW_FILES_COLLECTED",
+                        "model_status": "NOT_TRAINED_OR_RERUN",
+                        "as_of_status": "NOT_VERIFIED",
+                        "still_not_supplied": ["Complete historical coaching and play-caller timelines",
+                            "Guaranteed receiver-corner and blocker-rusher assignments or film review",
+                            "Contemporary all-player agility/speed tracking",
+                            "Final inactives and workload expectations for every game",
+                            "Historical weather forecasts and travel arrival plans",
+                            "Timestamped sportsbook quotes, public splits and original expert picks"],
+                        "warnings": ["Files and field names do not prove historical completeness or predictive value.",
+                            "2025 injury availability conflicts with old documentation; inspect actual rows/timestamps.",
+                            "Do not treat missing report rows as healthy players.",
+                            "Schedule starter/coach/referee/weather fields require pregame timing verification.",
+                            "Lag play-by-play, snaps and tracking; exclude target-game results and full-season summaries.",
+                            "FTN charting is not complete film or route-defender tracking.",
+                            "Postseason-only participation archives deliberately excluded from this collection."]}
+              (out / "run_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+              summary = [f"# NFL {year} public data collection", "", report["status"],
+                         f"Checked files: {report['checked_files']} / {len(records)}", "",
+                         "This is raw data collection only. No model, prediction, or backtest was run.", "",
+                         "| Dataset | Status | Rows |", "|---|---|---:|"]
+              summary += [f"| {x['family']} | {x['status']} | {x.get('rows_all', 'N/A')} |" for x in records]
+              summary += ["", "Historical publication timing and completeness still require review.",
+                          "2025 injury timestamps and the changed depth-chart schema need special attention.",
+                          "FTN charting attribution: FTN Data via nflverse (CC-BY-SA 4.0). Other files retain their upstream terms.",
+                          "Source documentation: https://nflreadr.nflverse.com/articles/nflverse_data_schedule.html"]
+              text = "\n".join(summary) + "\n"
+              (out / "summary.md").write_text(text, encoding="utf-8")
+              (out / "ATTRIBUTION.md").write_text(
+                  "Public datasets sourced from nflverse repositories. Preserve upstream source/licensing terms.\n"
+                  "FTN charting: FTN Data via nflverse, CC-BY-SA 4.0.\n"
+                  "See https://nflreadr.nflverse.com/reference/load_ftn_charting.html\n", encoding="utf-8")
               if os.getenv("GITHUB_STEP_SUMMARY"):
-                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
-                      handle.write(summary)
-              return 0 if passed else 1
-
-
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                      f.write(text)
+              return 1 if blockers else 0
+          
+          
           if __name__ == "__main__":
               raise SystemExit(main())
           PYTHON
-      - name: Save raw files and verification report
+      - name: Save downloaded files and gap reports
         if: always()
-        # Verified actions/upload-artifact v7.0.1, pinned to commit.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: nfl-public-data-check-${{ github.run_id }}
-          path: nfl-data-check/
+          name: nfl-public-${{ matrix.season }}-${{ github.run_id }}
+          path: nfl-public-data/${{ matrix.season }}/
           if-no-files-found: error
           retention-days: 7
           compression-level: 6
