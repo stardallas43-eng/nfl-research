@@ -1,4 +1,4 @@
- NFL name: NFL historical public-data collection
+ name: NFL historical public-data collection
 
 # Raw public inputs only. No wagers, personal records, paid services or credentials.
 # Replaces the two-file transfer check. This does NOT train the full NFL model.
